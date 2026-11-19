@@ -1328,6 +1328,16 @@ td .dot { margin-right: 6px; vertical-align: -1px; }
       const v = shots[i]; if (!v.volleyed) continue;
       if (shots.some(o => o !== v && !o.volleyed && Math.abs(o.frameHit - v.frameHit) <= 4 && o.frameBounce >= v.frameEnd - 2)) shots.splice(i, 1);
     }
+    // ...and a flight that starts in the middle of another shot's flight and 'bounces' where that shot
+    // was struck back is a ghost: one ball can't be on two flights at once
+    {
+      const kept = [];
+      for (const o of shots.slice().sort((p, q) => p.frameHit - q.frameHit)) {
+        const ghost = !o.volleyed && kept.some(v => o.frameHit > v.frameHit + 4 && o.frameHit < v.frameBounce - 3 && Math.abs(o.frameBounce - v.frameEnd) <= 3);
+        if (!ghost) kept.push(o);
+      }
+      shots.length = 0; shots.push(...kept);
+    }
     shots.sort((p, q) => p.frameHit - q.frameHit);
     // a shot whose incoming ball never bounced is a volley (or an overhead)
     for (const s of shots) {
@@ -3810,12 +3820,20 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
     const u = r - v.margin; // ball centre past the outer edge of the line, metres
     const along = /sideline|centre/.test(v.line) ? 'y' : 'x';
     const su = v.sigma, sv = along === 'x' ? v.sx : v.sy;
-    const span = Math.max(0.36, 2 * (Math.abs(u) + 2.2 * su + BR));
-    const k = Wc / span, ox = Wc / 2 - k * (u / 2 - 0.025); // centre between line and ball
+    const far = Math.abs(u) > 0.6; // well clear of the line: show the line and say how far, rather than a speck
+    const span = far ? 0.5 : Math.max(0.36, 2 * (Math.abs(u) + 2.2 * su + BR));
+    const k = Wc / span, ox = far ? Wc * (u < 0 ? 0.72 : 0.28) : Wc / 2 - k * (u / 2 - 0.025); // centre between line and ball
     const X = q => ox + k * q, Y0 = Hc / 2;
     g.fillStyle = surf; g.fillRect(0, 0, Wc, Hc);
     g.fillStyle = outS; g.fillRect(X(0), 0, Wc - X(0), Hc);
     g.fillStyle = '#f4f6f8'; g.fillRect(X(-0.05), 0, k * 0.05, Hc);
+    if (far) {
+      g.fillStyle = 'rgba(255,255,255,.92)'; g.font = `700 13px ${css('--font-body')}`; g.textAlign = 'center';
+      const xm = u < 0 ? X(-0.05) / 2 : (X(0) + Wc) / 2;
+      g.fillText(u < 0 ? `◀ ${(-u).toFixed(2)} m inside` : `${(u - r).toFixed(2)} m out ▶`, xm, Y0 + 4);
+      g.font = `600 11px ${css('--font-body')}`; g.fillText('10 cm', Wc / 2, 14); g.fillRect(Wc / 2 - 0.05 * k, 18, 0.1 * k, 2);
+      return;
+    }
     // 2-sigma uncertainty ellipse
     g.save(); g.setLineDash([4, 3]); g.strokeStyle = 'rgba(255,255,255,.9)'; g.lineWidth = 1.5;
     g.beginPath(); g.ellipse(X(u), Y0, Math.max(2, 2 * su * k), Math.max(2, Math.min(Hc / 2 - 2, 2 * sv * k)), 0, 0, 6.283); g.stroke(); g.restore();
@@ -3838,7 +3856,7 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
       const chips = ev.map(e => `<span class="ev ${e.dir}" title="${e.kind}">${e.dir === 'in' ? 'IN' : 'OUT'} · ${esc(e.text)}</span>`).join('');
       const conflict = c.conflict ? `<span class="conflict">⚠ Signals disagree: the ball's path says ${c.visualP >= 0.5 ? 'IN' : 'OUT'}, the players' reactions say ${c.otherLogOdds > 0 ? 'IN' : 'OUT'}</span>` : '';
       return `<div class="call${s.id === S.sel ? ' sel' : ''}" data-id="${s.id}"><canvas width="392" height="236" data-z="${s.id}"></canvas><div>
-        <div class="top"><span class="big" style="color:${callColor(c)}">${callWord(c)}</span><span class="num">${Math.round(c.conf * 100)}%</span><span class="basis">${c.level === 'too close' ? 'Inconclusive' : c.level === 'confirmed' ? 'Confirmed' : 'Likely'} · ${esc(c.basis)}</span>${conflict}</div>
+        <div class="top"><span class="big" style="color:${callColor(c)}">${callWord(c)}</span><span class="num">${Math.round(c.conf * 100)}%</span><span class="basis">${c.level === 'too close' ? 'Inconclusive: not enough evidence either way' : (c.level === 'confirmed' ? 'Confirmed' : 'Likely') + ' · ' + esc(c.basis)}</span>${conflict}</div>
         <div class="why">#${s.id} ${esc(s.type === 'serve' ? 'Serve' : 'Shot')} by ${esc(nameOf(s.playerId))} at ${fmt(S.t0 + s.tBounce, 2)} s. ${callSentence(s)}. The path alone says ${Math.round(c.visualP * 100)}% in${s.visual.seen ? '' : '; the bounce itself was hidden, so its spot was worked out from the flight either side'}.${s.truth ? ` <span class="truth">Truth: ${s.truth.in ? 'IN' : 'OUT'}</span>` : ''}</div>
         <div class="chips2">${chips || '<span class="muted" style="font-size:12px">No reactions or sounds to weigh</span>'}</div></div></div>`;
     }).join('');
