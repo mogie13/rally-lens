@@ -167,6 +167,13 @@ tbody tr.sel { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--a
 .res { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 99px; }
 .res.in { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
 .res.out { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+.rating-why { font-size: 12.5px; line-height: 1.55; padding: 0 20px 16px; margin: 0; }
+.rating-why .rw { display: block; margin-top: 4px; }
+.teams { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; padding: 16px 20px 20px; }
+.team { border: 1px solid var(--line, rgba(127,127,127,.25)); border-radius: 12px; padding: 12px 14px; font-size: 13.5px; }
+.team h3 { margin: 0 0 8px; font-size: 15px; }
+.team table { width: 100%; font-size: 13px; margin-top: 6px; }
+.team td, .team th { padding: 3px 4px; }
 .res.unsure { background: color-mix(in srgb, #d08a12 20%, transparent); color: #a86a00; }
 .calls { display: grid; gap: 10px; padding: 4px 20px 20px; }
 .call { display: grid; grid-template-columns: 196px 1fr; gap: 14px; align-items: start; padding: 10px; border: 1px solid var(--line, rgba(127,127,127,.25)); border-radius: 12px; cursor: pointer; }
@@ -314,7 +321,7 @@ td .dot { margin-right: 6px; vertical-align: -1px; }
       </div>
       <div class="card">
         <div class="hd"><h2>Highlights</h2><span class="muted" style="font-size:13px">Picked automatically: aces, winners, fastest and best shots, close calls</span></div>
-        <div class="hl-bar"><button class="btn small primary" id="btnReel" type="button">Play reel</button><button class="btn small" id="btnRec" type="button">Record reel</button><a class="btn small" id="reelLink" hidden download="rally-lens-highlights.webm">Download video</a><span class="status" id="hlStatus"></span></div>
+        <div class="hl-bar"><button class="btn small primary" id="btnReel" type="button">Play reel</button><button class="btn small" id="btnRec" type="button">Record reel</button><button class="btn small" id="btnRecV" type="button" title="A 9:16 video that follows the ball, sized for WhatsApp status and Instagram">Vertical reel for WhatsApp</button><a class="btn small" id="reelLink" hidden download="rally-lens-highlights.webm">Download video</a><button class="btn small primary" id="reelShare" type="button" hidden>Share</button><span class="status" id="hlStatus"></span></div>
         <ul class="hl-list" id="hlList"></ul>
       </div>
     <details class="card notes" open>
@@ -461,7 +468,14 @@ td .dot { margin-right: 6px; vertical-align: -1px; }
       <div class="card">
         <div class="hd"><h2>Players</h2><span class="muted" style="font-size:13px">Each shot is credited to the player nearest the contact</span></div>
         <div class="table-wrap"><table id="plTable"><thead></thead><tbody></tbody></table></div>
+        <p class="muted rating-why" id="ratingWhy"></p>
       </div>
+    </section>
+
+    <section class="card" id="netCard">
+      <div class="hd"><h2>Net play and teamwork</h2><span class="muted" style="font-size:13px">Volleys for everyone; in doubles, how each pair worked together</span></div>
+      <div class="table-wrap"><table id="volTable"><thead></thead><tbody></tbody></table></div>
+      <div id="teamBox" class="teams"></div>
     </section>
 
     <section class="split">
@@ -2181,11 +2195,113 @@ td .dot { margin-right: 6px; vertical-align: -1px; }
     return res;
   }
 
+
+  // ------------------------------------------- pressure, rating, net play
+  // How much a shot stretched the opponent, in the spirit of TDI's shot quality:
+  // how far the receiver had to run to reach it (and whether it pushed them behind
+  // the baseline), or full marks if it wasn't returned. Blended in at 20%.
+  const PRESSURE_W = 0.2;
+  function applyPressure(shots, players, fps) {
+    const S = shots.slice().sort((a, b) => a.frameHit - b.frameHit);
+    for (let i = 0; i < S.length; i++) {
+      const s = S[i], c = s.components; if (!c) continue;
+      const n = S[i + 1];
+      let p = null, note = '';
+      const reply = n && n.type !== 'serve' && n.hitter !== s.hitter && n.frameHit - s.frameHit < 4 * fps;
+      if (reply) {
+        const who = players && players.find(q => q.id === n.playerId);
+        const a = who && playerAt(who, s.frameHit), b = who && playerAt(who, n.frameHit);
+        if (a && b) {
+          const run = Math.hypot(b[0] - a[0], b[1] - a[1]), back = Math.max(0, Math.abs(b[1]) - COURT.halfLen);
+          p = 0.75 * clamp01((run - 1) / 6) + 0.25 * clamp01(back / 2.5);
+          note = `Opponent ran ${run.toFixed(1)} m${back > 0.3 ? `, ${back.toFixed(1)} m behind the baseline` : ''}`;
+        }
+      } else if (s.in) {
+        p = 1; note = 'Not returned';
+      }
+      c.pressure = p; c.pressureNote = note;
+      const raw = p == null ? c.raw : (1 - PRESSURE_W) * c.raw + PRESSURE_W * p;
+      c.rawTotal = raw;
+      s.quality = c.quality = s.in ? Math.round(raw * 100) / 10 : 0;
+    }
+    return shots;
+  }
+  // A 0-10 rating that shows its working: every part, its value and its weight.
+  const RATING_PARTS = [['quality', 'Average shot quality', 0.5], ['inRate', 'Shots in', 0.2], ['points', 'Points won', 0.2], ['clean', 'Avoiding errors', 0.1]];
+  function playerRating(shots, match, id) {
+    const S = shots.filter(s => s.playerId === id); if (!S.length) return null;
+    const v = {};
+    v.quality = S.reduce((t, s) => t + s.quality, 0) / S.length / 10;
+    v.inRate = S.filter(s => s.in).length / S.length;
+    const ms = match ? matchStats(match, shots, id, false) : null;
+    v.points = ms && ms.pointsPlayed ? ms.pointsWon / ms.pointsPlayed : null;
+    const errors = ms ? ms.unforced + ms.doubleFaults : S.filter(s => !s.in).length;
+    v.clean = 1 - Math.min(1, errors / S.length);
+    let sw = 0, sum = 0; const parts = [];
+    for (const [k, name, w] of RATING_PARTS) { if (v[k] == null) continue; sw += w; sum += w * v[k]; parts.push({ key: k, name, value: v[k], weight: w }); }
+    parts.forEach(p => { p.share = p.weight / sw; });
+    return { rating: Math.round(100 * sum / sw) / 10, parts };
+  }
+  function volleyStats(shots, match, id) {
+    const V = shots.filter(s => s.playerId === id && (s.type === 'volley' || s.type === 'overhead'));
+    const avg = (a, f) => { const x = a.map(f).filter(v => v != null && isFinite(v)); return x.length ? x.reduce((t, y) => t + y, 0) / x.length : null; };
+    const firsts = [];
+    if (match) for (const p of match.points) { const f = p.shots.find(s => s.playerId === id && s.type === 'volley'); if (f && f.in) firsts.push(f); }
+    const ms = match ? matchStats(match, shots, id, false) : null;
+    return {
+      volleys: V.length, overheads: V.filter(s => s.type === 'overhead').length,
+      inPct: V.length ? 100 * V.filter(s => s.in).length / V.length : null,
+      height: avg(V, s => s.contact[2]), fromNet: avg(V, s => s.netDist), reactionMs: avg(V, s => s.reactionMs),
+      speed: avg(V, s => s.speedKmh), quality: avg(V, s => s.quality),
+      firstDepth: avg(firsts, s => s.volleyed ? Math.abs(s.intercept[1]) : Math.abs(s.bounce.Y)),
+      netPoints: ms ? ms.netPoints : null, netWon: ms ? ms.netPointsWon : null
+    };
+  }
+  // Doubles teamwork for one side: who takes the balls down the middle,
+  // poaches, and how much of each rally the pair spent in each formation.
+  function teamwork(shots, players, match, side, fps) {
+    const sgn = side === 'near' ? -1 : 1, ids = PLAYER_SETS.doubles.filter(p => p.side === sgn).map(p => p.id);
+    const P = ids.map(id => (players || []).find(p => p.id === id));
+    if (P.some(p => !p)) return null;
+    // each player's usual half of the court, from where they stood
+    const home = {};
+    P.forEach(p => { const xs = p.track.filter(Boolean).map(q => q[0]).sort((a, b) => a - b); home[p.id] = xs.length ? Math.sign(xs[xs.length >> 1]) || 1 : 1; });
+    const S = shots.slice().sort((a, b) => a.frameHit - b.frameHit);
+    const middle = { taken: Object.fromEntries(ids.map(i => [i, 0])), missed: 0, total: 0 };
+    S.forEach((o, i) => {
+      if (o.hitter === side || o.type === 'serve') return;
+      const pt = o.volleyed ? o.intercept : [o.bounce.X, o.bounce.Y];
+      if (!o.in && !o.volleyed) return;
+      if (Math.abs(pt[0]) > 1.0) return;
+      middle.total++;
+      const r = S[i + 1];
+      if (r && r.hitter === side && r.frameHit - o.frameHit < 4 * fps && middle.taken[r.playerId] != null) middle.taken[r.playerId]++;
+      else middle.missed++;
+    });
+    const poach = Object.fromEntries(ids.map(i => [i, { n: 0, won: 0 }]));
+    const ptOf = s => match ? match.points.find(p => p.shots.includes(s)) : null;
+    S.forEach(s => {
+      if (s.hitter !== side || s.type !== 'volley' || poach[s.playerId] == null) return;
+      if (Math.abs(s.contact[0]) > 0.5 && Math.sign(s.contact[0]) !== home[s.playerId]) { poach[s.playerId].n++; const p = ptOf(s); if (p && p.winner === side) poach[s.playerId].won++; }
+    });
+    // formation: each 0.2 s of rally time, is each player up (within 7 m of the net) or back?
+    const form = { 'Both back': { t: 0, won: 0, played: 0 }, 'One up, one back': { t: 0, won: 0, played: 0 }, 'Both up': { t: 0, won: 0, played: 0 } };
+    const kind = f => { const up = P.map(p => { const q = playerAt(p, f); return q ? Math.abs(q[1]) < 7 : null; }); if (up.includes(null)) return null; const n = up.filter(Boolean).length; return n === 0 ? 'Both back' : n === 1 ? 'One up, one back' : 'Both up'; };
+    const step = Math.max(1, Math.round(fps / 5));
+    for (const p of (match ? match.points : [])) {
+      if (!p.shots.length) continue;
+      const a = p.shots[0].frameHit, b = p.shots[p.shots.length - 1].frameEnd || p.shots[p.shots.length - 1].frameHit;
+      for (let f = a; f <= b; f += step) { const k = kind(f); if (k) form[k].t += step / fps; }
+      if (p.winner) { const L = p.shots[p.shots.length - 1], k = kind(L.frameHit); if (k) { form[k].played++; if (p.winner === side) form[k].won++; } }
+    }
+    return { ids, middle, poach, form };
+  }
+
   root.TE = {
     COURT, G, BALL_R, KAERO, CD,
     homography, applyH, inv3, cornerWorld, cameraFromH, camLookAt, project, rayDir, homographyFromCam, courtLines, netHeight,
     accel, integrate, sampleAt, velAt, groundCross, netCross, bounce,
-    fitFlight, backtrack, lineCall, analyzeAudio, callEvidence, fuseCall, applyLineCalls, createStabilizer, buildInsights, buildHighlights, shotDirection, scoreMatch, matchStats, playerMovement, createDetector, downsample, medianBackground, createPlayerDetector, trackPlayers, attributeShots, summarizePlayer, PLAYER_SETS, PQ, buildTrack, analyze, scoreShot, summarize
+    fitFlight, backtrack, lineCall, analyzeAudio, callEvidence, fuseCall, applyLineCalls, createStabilizer, buildInsights, buildHighlights, shotDirection, scoreMatch, matchStats, playerMovement, createDetector, downsample, medianBackground, createPlayerDetector, trackPlayers, attributeShots, summarizePlayer, PLAYER_SETS, PQ, buildTrack, analyze, scoreShot, summarize, applyPressure, playerRating, RATING_PARTS, volleyStats, teamwork
   };
 })(typeof window !== 'undefined' ? window : globalThis);
 
@@ -3346,7 +3462,8 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
     for (const p of roster()) {
       const all = S.res ? S.res.shots : []; if (!all.some(s => s.playerId === p.id)) continue;
       const sm = TE.summarizePlayer(all, p.id), ms = M ? TE.matchStats(M, all, p.id, false) : null, mv = (S.moves || {})[p.id];
-      L.push(`  ${p.name}: rating ${fmt(sm.performance, 1)}/10, ${sm.shots} shots, ${fmt(sm.inPct)}% in, top ${fmt(sm.topSpeed)} km/h, spin ${fmt(Math.abs(sm.avgRpm || 0))} rpm${ms ? `, ${ms.winners} winners, ${ms.unforced} unforced errors` : ''}${mv ? `, ran ${fmt(mv.distance)} m` : ''}`);
+      const rt = TE.playerRating(all, M, p.id);
+      L.push(`  ${p.name}: rating ${rt ? fmt(rt.rating, 1) : fmt(sm.performance, 1)}/10, ${sm.shots} shots, ${fmt(sm.inPct)}% in, top ${fmt(sm.topSpeed)} km/h, spin ${fmt(Math.abs(sm.avgRpm || 0))} rpm${ms ? `, ${ms.winners} winners, ${ms.unforced} unforced errors` : ''}${mv ? `, ran ${fmt(mv.distance)} m` : ''}`);
     }
     const ins = S.res ? roster().flatMap(p => TE.buildInsights(S.res.shots, M, p.id, { moves: S.moves }).map(n => Object.assign({ who: p.name }, n))) : [];
     if (ins.length) { L.push(''); L.push("Coach's notes"); for (const n of ins) L.push(`  [${n.kind === 'work' ? 'Work on' : n.kind === 'strength' ? 'Strength' : 'Tip'}] ${n.who}: ${n.title}. ${n.detail}`); }
@@ -3364,16 +3481,16 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
   function renderHighlights() {
     S.highlights = S.res ? TE.buildHighlights(S.res.shots, S.match, S.fps) : [];
     const ul = $('#hlList'), H = S.highlights;
-    $('#btnReel').disabled = $('#btnRec').disabled = !H.length;
+    $('#btnReel').disabled = $('#btnRec').disabled = $('#btnRecV').disabled = !H.length;
     if (!H.length) { ul.innerHTML = `<li style="cursor:default"><span></span><span class="s">${S.res ? 'Nothing stood out in this clip yet.' : 'Highlights appear here after analysis.'}</span><span></span></li>`; return; }
     ul.innerHTML = H.map((c, i) => { const s = byId(c.shotId); return `<li data-i="${i}" tabindex="0"><span class="n">${i + 1}</span><span><div class="t">${esc(c.title)}</div><div class="s">${s ? esc(pinfo(s.playerId).name) + ' · ' : ''}${c.tags.join(' · ')}</div></span><span class="d">${(S.t0 + c.t0).toFixed(1)} s · ${(c.t1 - c.t0).toFixed(1)} s</span></li>`; }).join('');
     ul.querySelectorAll('li[data-i]').forEach(li => { const go = () => startReel([H[+li.dataset.i]], false); li.addEventListener('click', go); li.addEventListener('keydown', e => { if (e.key === 'Enter') go(); }); });
   }
   let rec = null;
-  function startReel(clips, record) {
+  function startReel(clips, record, vertical) {
     stopReel(true);
     S.reel = { clips, i: 0, record };
-    if (record) startRecorder();
+    if (record) startRecorder(vertical);
     playClip(0);
   }
   function playClip(i) {
@@ -3398,19 +3515,48 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
   }
   $('#btnReel').addEventListener('click', () => { if (S.reel && !S.reel.record) { stopReel(false); return; } $('#btnReel').textContent = 'Stop'; startReel(S.highlights, false); });
   // Recording: the video plus overlays are composited onto a canvas and captured.
-  function startRecorder() {
-    const cv = document.createElement('canvas'); cv.width = S.W; cv.height = S.H;
+  function startRecorder(vertical) {
+    const cv = document.createElement('canvas'); cv.width = vertical ? 720 : S.W; cv.height = vertical ? 1280 : S.H;
     if (!cv.captureStream || !window.MediaRecorder) { $('#hlStatus').textContent = 'This browser can\'t record video. Use Play reel instead.'; S.reel.record = false; return; }
-    const types = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
+    // WhatsApp plays MP4 (H.264) but not WebM, so the vertical reel asks for MP4 first
+    const types = vertical ? ['video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'] : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4'];
     const mime = types.find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
     const mr = new MediaRecorder(cv.captureStream(30), mime ? { mimeType: mime, videoBitsPerSecond: 4e6 } : undefined);
     const chunks = []; mr.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-    rec = { cv, ctx: cv.getContext('2d'), mr, chunks, mime: mime || 'video/webm', prevRate: S.rate };
+    rec = { cv, ctx: cv.getContext('2d'), mr, chunks, mime: mime || 'video/webm', prevRate: S.rate, vertical: !!vertical, cx: S.W / 2 };
     S.rate = 1; $('#rate').value = '1';
-    mr.start(250); $('#hlStatus').textContent = 'Recording…'; $('#btnRec').textContent = 'Stop recording';
+    mr.start(250); $('#hlStatus').textContent = 'Recording…'; $(vertical ? '#btnRecV' : '#btnRec').textContent = 'Stop recording';
+  }
+  // Vertical 9:16 frame: title and score on top, a crop that follows the ball, shot numbers below.
+  function wrapText(c, text, maxW) { const words = String(text).split(' '), lines = []; let cur = ''; for (const w of words) { const t = cur ? cur + ' ' + w : w; if (c.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; } if (cur) lines.push(cur); return lines; }
+  function compositeVertical() {
+    const c = rec.ctx, VW = 720, VH = 1280, top = 190, bot = 1110, R = S.reel, clip = R && R.clips[R.i];
+    c.fillStyle = '#0c1826'; c.fillRect(0, 0, VW, VH);
+    // follow the ball across the frame, smoothly
+    const f = Math.round((curTime() - S.t0) * S.fps), b = S.track && S.track[f];
+    const cw = S.H * VW / (bot - top), target = b ? b.x : rec.cx;
+    rec.cx += 0.12 * (target - rec.cx);
+    const sx = Math.max(0, Math.min(S.W - cw, rec.cx - cw / 2));
+    try { c.drawImage(S.mode === 'video' ? vid : demoC, sx, 0, cw, S.H, 0, top, VW, bot - top); } catch (e) { /* frame not ready */ }
+    const k = ov.width / S.W; c.drawImage(ov, sx * k, 0, cw * k, ov.height, 0, top, VW, bot - top);
+    const font = css('--font-body');
+    c.fillStyle = '#d6ee3c'; c.font = `800 26px ${font}`; c.textAlign = 'left'; c.fillText('RALLY LENS', 36, 56);
+    if (clip) {
+      c.fillStyle = '#fff'; c.font = `700 40px ${font}`;
+      wrapText(c, clip.title, VW - 72).slice(0, 2).forEach((l, i) => c.fillText(l, 36, 108 + i * 46));
+      const pt = S.match && S.match.points.find(p => p.shots.some(s => s.id === clip.shotId));
+      if (pt && pt.scoreBefore) { c.font = `600 24px ${font}`; c.fillStyle = '#9fb3c8'; c.textAlign = 'right'; c.fillText(`Games ${pt.scoreBefore.games.join('–')} · ${pt.scoreBefore.label}`, VW - 36, 56); c.textAlign = 'left'; }
+      const s = clip.shotId && byId(clip.shotId);
+      c.fillStyle = '#fff'; c.font = `700 34px ${font}`;
+      if (s) c.fillText(nameOf(s.playerId), 36, bot + 60);
+      c.font = `500 28px ${font}`; c.fillStyle = '#c9d6e3';
+      if (s) c.fillText(`${Math.round(s.speedKmh)} km/h · ${s.spinLabel} · Quality ${s.quality.toFixed(1)}`, 36, bot + 104);
+      if (clip.tags && clip.tags.length) { c.font = `500 24px ${font}`; c.fillStyle = '#9fb3c8'; c.fillText(clip.tags.join(' · ').slice(0, 48), 36, bot + 144); }
+    }
   }
   function compositeFrame() {
     if (!rec) return;
+    if (rec.vertical) { compositeVertical(); return; }
     const c = rec.ctx;
     try { c.drawImage(S.mode === 'video' ? vid : demoC, 0, 0, S.W, S.H); } catch (e) { /* frame not ready */ }
     c.drawImage(ov, 0, 0);
@@ -3422,10 +3568,13 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
     const r = rec; rec = null; S.rate = r.prevRate; $('#rate').value = String(r.prevRate);
     r.mr.onstop = () => {
       const blob = new Blob(r.chunks, { type: r.mime.split(';')[0] }), url = URL.createObjectURL(blob);
-      const a = $('#reelLink'); a.href = url; a.download = 'rally-lens-highlights.' + (r.mime.includes('mp4') ? 'mp4' : 'webm'); a.hidden = false;
+      const a = $('#reelLink'); a.href = url; a.download = (r.vertical ? 'rally-lens-reel-vertical.' : 'rally-lens-highlights.') + (r.mime.includes('mp4') ? 'mp4' : 'webm'); a.hidden = false;
       a.textContent = `Download video (${(blob.size / 1e6).toFixed(1)} MB)`;
-      $('#hlStatus').textContent = 'Reel ready to save.';
-      $('#btnRec').textContent = 'Record reel';
+      const canShare = (window.RallyLensAndroid && window.RallyLensAndroid.shareFile) || (navigator.canShare && navigator.canShare({ files: [new File([blob], a.download, { type: blob.type })] }));
+      $('#reelShare').hidden = !canShare;
+      $('#hlStatus').textContent = r.vertical && !r.mime.includes('mp4') ? 'Reel ready. This browser could only make WebM, which WhatsApp may not play; Chrome on Android makes MP4.' : canShare ? 'Reel ready: share it straight to WhatsApp, or save it.' : 'Reel ready to save. Share it from your gallery or Downloads.';
+      $('#btnRec').textContent = 'Record reel'; $('#btnRecV').textContent = 'Vertical reel for WhatsApp';
+      S.lastReel = blob;
     };
     r.mr.stop();
   }
@@ -3453,7 +3602,20 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
     const ok = window.RallyLensAndroid.saveFile(b64, $('#reelLink').download, blob.type || 'video/webm');
     $('#hlStatus').textContent = ok ? 'Saved to your Downloads folder.' : 'Couldn\'t save the video on this phone.';
   });
-  $('#btnRec').addEventListener('click', () => { if (S.reel && S.reel.record) { stopReel(false); return; } $('#reelLink').hidden = true; startReel(S.highlights, true); });
+  $('#btnRec').addEventListener('click', () => { if (S.reel && S.reel.record) { stopReel(false); return; } $('#reelLink').hidden = true; $('#reelShare').hidden = true; startReel(S.highlights, true, false); });
+  $('#btnRecV').addEventListener('click', () => { if (S.reel && S.reel.record) { stopReel(false); return; } $('#reelLink').hidden = true; $('#reelShare').hidden = true; startReel(S.highlights, true, true); });
+  $('#reelShare').addEventListener('click', async () => {
+    const blob = S.lastReel; if (!blob) return;
+    const name = $('#reelLink').download, type = blob.type || 'video/mp4';
+    try {
+      if (window.RallyLensAndroid && window.RallyLensAndroid.shareFile) {
+        const b64 = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(String(fr.result).split(',')[1]); fr.readAsDataURL(blob); });
+        if (!window.RallyLensAndroid.shareFile(b64, name, type)) $('#hlStatus').textContent = 'Couldn\'t open sharing on this phone; the video is in Downloads.';
+        return;
+      }
+      await navigator.share({ files: [new File([blob], name, { type })], title: 'Rally Lens highlights', text: 'My tennis highlights, made with Rally Lens' });
+    } catch (e) { if (e && e.name !== 'AbortError') $('#hlStatus').textContent = 'Sharing didn\'t work here. Download the video and share it from WhatsApp.'; }
+  });
 
   // ------------------------------------------------------------- history
   const SESS = 'sessions';
@@ -3510,6 +3672,7 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
       S.res = TE.analyze(S.track, { fps: S.fps, cam: S.cam, H: S.Hm, lineMode: S.lineMode, players: S.players, clicks: S.clicks, clickWorld: TE.cornerWorld(S.lineMode, S.nearRef), clickSigma: S.clickSigma });
       TE.attributeShots(S.res.shots, S.players, S.matchType);
       TE.applyLineCalls(S.res, { players: S.players, fps: S.fps, t0: S.t0, audio: S.audio, gestures: S.gestures, words: S.words, name: id => pinfo(id).name });
+      TE.applyPressure(S.res.shots, S.players, S.fps);
       S.res.shots.forEach(buildPaths);
       scoreNow();
     } catch (e) { console.error(e); S.res = null; setStatus('#anStatus', 'Analysis failed on this clip: ' + e.message, true); }
@@ -3896,20 +4059,47 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
       tile('Shots in play', fmt(sum && sum.inPct), sum ? '%' : '', sum ? `${shots.filter(s => s.in).length} of ${shots.length}, volleyed balls count as in` : '—') +
       tile('Top speed', fmt(sum && sum.topSpeed), sum ? 'km/h' : '', sum ? `Average ${fmt(sum.avgSpeed)} km/h · spin ${fmt(sum.avgRpm != null ? Math.abs(sum.avgRpm) : null)} rpm` : '—') +
       tile('Volley quality', fmt(sum && sum.volleyQuality, 1), sum && sum.volleyQuality != null ? '/10' : '', sum && sum.volleys ? `${sum.volleys} volley${sum.volleys > 1 ? 's' : ''} or overhead${sum.volleys > 1 ? 's' : ''}` : 'No volleys in this view');
-    renderInsights(); renderHighlights(); renderMatch(); renderMatchStats(); renderPlayers(); renderTable(shots); renderMap(shots); renderDetail(); draw3d(); renderHistory(); renderCalls();
+    renderInsights(); renderHighlights(); renderMatch(); renderMatchStats(); renderPlayers(); renderTable(shots); renderMap(shots); renderDetail(); draw3d(); renderHistory(); renderCalls(); renderNet();
   }
   function renderPlayers() {
     const R = roster(), all = S.res ? S.res.shots : [];
-    $('#plTable thead').innerHTML = '<tr><th>Player</th><th class="r">Shots</th><th class="r">In</th><th class="r">Rating</th><th class="r">Serve</th><th class="r">Rally</th><th class="r">Volley</th><th class="r">Winners</th><th class="r">Errors</th><th class="r">Top speed</th><th class="r">Avg spin</th><th class="r">Ran</th></tr>';
+    $('#plTable thead').innerHTML = '<tr><th>Player</th><th class="r">Shots</th><th class="r">In</th><th class="r">Rating</th><th class="r">Serve Q</th><th class="r">Rally Q</th><th class="r">Volley Q</th><th class="r">Winners</th><th class="r">Errors</th><th class="r">Top speed</th><th class="r">Avg spin</th><th class="r">Ran</th></tr>';
     $('#plTable tbody').innerHTML = R.map(p => {
       const sm = all.some(s => s.playerId === p.id) ? TE.summarizePlayer(all, p.id) : null;
-      const ms = S.match ? TE.matchStats(S.match, all, p.id, false) : null, mv = (S.moves || {})[p.id];
-      return `<tr data-f="${p.id}" tabindex="0" class="${S.filter === p.id ? 'sel' : ''}"><td>${dotOf(p.id)}${esc(nameOf(p.id))}</td><td class="r">${sm ? sm.shots : 0}</td><td class="r">${sm ? fmt(sm.inPct) + '%' : '—'}</td><td class="r"><b>${sm ? fmt(sm.performance, 1) : '—'}</b></td><td class="r">${sm ? fmt(sm.serveQuality, 1) : '—'}</td><td class="r">${sm ? fmt(sm.rallyQuality, 1) : '—'}</td><td class="r">${sm ? fmt(sm.volleyQuality, 1) : '—'}</td><td class="r">${ms ? ms.winners : '—'}</td><td class="r">${ms ? ms.unforced + ms.forced + ms.doubleFaults : '—'}</td><td class="r">${sm ? fmt(sm.topSpeed) + ' km/h' : '—'}</td><td class="r">${sm && sm.avgRpm != null ? fmt(Math.abs(sm.avgRpm)) + ' rpm' : '—'}</td><td class="r">${mv ? fmt(mv.distance) + ' m' : '—'}</td></tr>`;
+      const ms = S.match ? TE.matchStats(S.match, all, p.id, false) : null, mv = (S.moves || {})[p.id], rt = sm ? TE.playerRating(all, S.match, p.id) : null;
+      return `<tr data-f="${p.id}" tabindex="0" class="${S.filter === p.id ? 'sel' : ''}"><td>${dotOf(p.id)}${esc(nameOf(p.id))}</td><td class="r">${sm ? sm.shots : 0}</td><td class="r">${sm ? fmt(sm.inPct) + '%' : '—'}</td><td class="r" title="${rt ? esc(rt.parts.map(x => `${x.name}: ${Math.round(x.value * 100)}% × ${Math.round(x.share * 100)}%`).join('\n')) : ''}"><b>${rt ? fmt(rt.rating, 1) : '—'}</b></td><td class="r">${sm ? fmt(sm.serveQuality, 1) : '—'}</td><td class="r">${sm ? fmt(sm.rallyQuality, 1) : '—'}</td><td class="r">${sm ? fmt(sm.volleyQuality, 1) : '—'}</td><td class="r">${ms ? ms.winners : '—'}</td><td class="r">${ms ? ms.unforced + ms.forced + ms.doubleFaults : '—'}</td><td class="r">${sm ? fmt(sm.topSpeed) + ' km/h' : '—'}</td><td class="r">${sm && sm.avgRpm != null ? fmt(Math.abs(sm.avgRpm)) + ' rpm' : '—'}</td><td class="r">${mv ? fmt(mv.distance) + ' m' : '—'}</td></tr>`;
     }).join('');
+    const rows = R.map(p => ({ p, rt: TE.playerRating(all, S.match, p.id) })).filter(x => x.rt);
+    $('#ratingWhy').innerHTML = rows.length ? `<b>How the rating works:</b> ${TE.RATING_PARTS.map(([, n, w]) => `${Math.round(w * 100)}% ${n.toLowerCase()}`).join(' + ')}, out of 10. Shot quality (Q) blends speed, spin, depth, width and heaviness with how far the shot made the opponent run. ` + rows.map(({ p, rt }) => `<span class="rw">${dotOf(p.id)}${esc(nameOf(p.id))} ${fmt(rt.rating, 1)} = ${rt.parts.map(x => `${Math.round(x.value * 100)}% ${x.name.toLowerCase()} × ${Math.round(x.share * 100)}%`).join(' + ')}</span>`).join('') : '';
     $('#plTable tbody').querySelectorAll('tr').forEach(r => {
       const go = () => { S.filter = S.filter === r.dataset.f ? 'all' : r.dataset.f; const v = visibleShots(); if (!v.find(s => s.id === S.sel)) S.sel = v[0] ? v[0].id : null; renderReport(); };
       r.addEventListener('click', go); r.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
     });
+  }
+  function renderNet() {
+    const R = roster(), all = S.res ? S.res.shots : [], M = S.match;
+    const ms = v => v == null ? '—' : v;
+    $('#volTable thead').innerHTML = '<tr><th>Player</th><th class="r">Volleys</th><th class="r">In</th><th class="r">Quality</th><th class="r">Contact height</th><th class="r">From net</th><th class="r">Reaction</th><th class="r">First-volley depth</th><th class="r">Net points won</th></tr>';
+    $('#volTable tbody').innerHTML = !S.res ? '<tr><td colspan="9" class="empty">Appears after analysis.</td></tr>' : R.map(p => {
+      const v = TE.volleyStats(all, M, p.id);
+      if (!v.volleys && !v.netPoints) return `<tr><td>${dotOf(p.id)}${esc(nameOf(p.id))}</td><td class="r">0</td><td colspan="7" class="muted">No volleys in this clip</td></tr>`;
+      return `<tr><td>${dotOf(p.id)}${esc(nameOf(p.id))}</td><td class="r">${v.volleys}${v.overheads ? ` <span class="muted">(${v.overheads} smash)</span>` : ''}</td><td class="r">${v.inPct != null ? fmt(v.inPct) + '%' : '—'}</td><td class="r">${v.quality != null ? fmt(v.quality, 1) : '—'}</td><td class="r">${v.height != null ? fmt(v.height, 2) + ' m' : '—'}</td><td class="r">${v.fromNet != null ? fmt(v.fromNet, 1) + ' m' : '—'}</td><td class="r">${v.reactionMs != null ? fmt(v.reactionMs) + ' ms' : '—'}</td><td class="r" title="How far past the net the first volley of a point landed (deeper is better)">${v.firstDepth != null ? fmt(v.firstDepth, 1) + ' m' : '—'}</td><td class="r">${v.netPoints ? `${v.netWon} of ${v.netPoints}` : '—'}</td></tr>`;
+    }).join('');
+    const box = $('#teamBox');
+    if (!S.res || S.matchType !== 'doubles') { box.innerHTML = S.res ? '<p class="muted" style="margin:0">Teamwork stats appear for doubles matches.</p>' : ''; return; }
+    box.innerHTML = ['near', 'far'].map(side => {
+      const t = TE.teamwork(all, S.players, M, side, S.fps);
+      if (!t) return `<div class="team"><h3>${esc(teamName(side))}</h3><p class="muted">Both players need to be tracked for teamwork stats.</p></div>`;
+      const [a, b] = t.ids, nm = id => `${dotOf(id)}${esc(nameOf(id))}`;
+      const mid = t.middle.total ? `${nm(a)} took ${t.middle.taken[a]}, ${nm(b)} took ${t.middle.taken[b]}${t.middle.missed ? `, <b>${t.middle.missed} went past or weren't returned</b>` : ''} (of ${t.middle.total})` : 'No balls down the middle in this clip';
+      const po = [a, b].map(id => t.poach[id].n ? `${nm(id)} ${t.poach[id].n} (won ${t.poach[id].won})` : '').filter(Boolean).join(', ') || 'None';
+      const tot = Object.values(t.form).reduce((x, f) => x + f.t, 0) || 1;
+      const rows = Object.entries(t.form).map(([k, f]) => `<tr><td>${k}</td><td class="r">${fmt(100 * f.t / tot)}%</td><td class="r">${f.played ? `${f.won} of ${f.played}` : '—'}</td></tr>`).join('');
+      return `<div class="team"><h3>${esc(teamName(side))}</h3>
+        <div><b>Balls down the middle:</b> ${mid}</div>
+        <div style="margin-top:4px"><b>Poaches</b> <span class="muted">(volleys taken on the partner's side)</span>: ${po}</div>
+        <table><thead><tr><th>Formation</th><th class="r">Rally time</th><th class="r">Points won when it ended</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    }).join('');
   }
   function renderTable(shots) {
     const demoMode = !!S.truth;
@@ -4045,10 +4235,11 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
     const inside = s.call ? `${callWord(s.call)} (${Math.round(s.call.conf * 100)}%) · ${callSentence(s)}` : s.in ? (s.type === 'serve' ? `${fmt(TE.COURT.svc - Math.abs(s.bounce.Y), 2)} m inside service line` : `${fmt(TE.COURT.halfLen - Math.abs(s.bounce.Y), 2)} m inside baseline`) : 'Out';
     const stat = (k, v, u, t) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}${u ? ` <small>${u}</small>` : ''}</div>${t ? `<div class="t">${t}</div>` : ''}</div>`;
     const c = s.components;
-    const bars = s.type === 'serve' ? [['Speed', c.speed, 55], ['Placement', c.placement, 30], ['Spin', c.spin, 15]]
+    let bars = s.type === 'serve' ? [['Speed', c.speed, 55], ['Placement', c.placement, 30], ['Spin', c.spin, 15]]
       : s.type === 'volley' ? [['Speed', c.speed, 30], ['Width', c.width, 30], ['Depth', c.depth, 25], ['Heaviness', c.bounce, 10], ['Spin', c.spin, 5]]
       : s.type === 'overhead' ? [['Speed', c.speed, 45], ['Width', c.width, 25], ['Depth', c.depth, 20], ['Heaviness', c.bounce, 10]]
       : [['Speed', c.speed, 30], ['Depth', c.depth, 25], ['Heaviness', c.bounce, 20], ['Spin', c.spin, 15], ['Width', c.width, 10]];
+    if (c.pressure != null) { bars = bars.map(([k, v, w]) => [k, v, Math.round(w * 0.8)]); bars.push(['Pressure', c.pressure, 20, c.pressureNote]); }
     const vBy = s.volleyed ? byId(s.volleyedById) : null;
     body.innerHTML = `
       <div class="detail-grid">
@@ -4067,7 +4258,8 @@ const DEMO = {"singles":{"W":960,"H":540,"fps":60,"n":1906,"lineMode":"singles",
           : stat('After the bounce', s.after ? fmt(s.after.speedKmh) : '—', s.after ? 'km/h' : '', s.after ? `Kick ${fmt(s.after.heightAtBaseline, 2)} m at the baseline` : 'Not enough frames after the bounce')}
         ${stat('Shot quality', `<span style="color:${s.in ? 'var(--ink)' : 'var(--bad)'}">${fmt(s.quality, 1)}</span>`, '/10', s.volleyed ? 'Scored on its projected landing' : s.in ? (s.close ? 'Landed close to a line' : 'Landed in') : 'Out, so it scores 0')}
       </div>
-      <div class="bars">${bars.map(([k, v, w]) => `<div class="bar"><span>${k} <span class="muted">${w}%</span></span><div class="track"><i style="width:${(v * 100).toFixed(0)}%"></i></div><span class="w num">${(v * 10).toFixed(1)}</span></div>`).join('')}</div>
+      <div class="bars">${bars.map(([k, v, w, note]) => `<div class="bar"${note ? ` title="${esc(note)}"` : ''}><span>${k} <span class="muted">${w}%</span></span><div class="track"><i style="width:${(v * 100).toFixed(0)}%"></i></div><span class="w num">${(v * 10).toFixed(1)}</span></div>`).join('')}</div>
+      ${c.pressure != null ? `<p class="muted" style="margin:4px 0 0;font-size:12.5px">Pressure: ${esc(c.pressureNote || '')}. It counts for 20% of shot quality, the other parts for the rest.</p>` : ''}
       <canvas id="sideCanvas" width="1200" height="380" aria-label="Side view of the ball's flight"></canvas>`;
     drawSide(s);
   }
